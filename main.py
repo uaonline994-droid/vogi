@@ -9,6 +9,7 @@ import time
 import hmac
 import hashlib
 import json
+import urllib.parse
 from urllib.parse import parse_qsl
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
@@ -19,7 +20,7 @@ from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto,
-    WebAppInfo, MenuButtonWebApp,
+    WebAppInfo, MenuButtonCommands,
 )
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -28,6 +29,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+try:
+    import psycopg2
+    _HAS_PG = True
+except ImportError:
+    psycopg2 = None
+    _HAS_PG = False
 
 # ================= НАЛАШТУВАННЯ =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8567214922:AAFdVBlri0WnmXZYN-szTqXUFcCZh0ZJQZA")
@@ -40,7 +48,14 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "a11_bot.db")
 PRE_LESSON_PING_MINUTES = 5
 
-# ---- Web App (Telegram Mini App) налаштування ----
+# PostgreSQL (Supabase) — порожньо = використовувати SQLite
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres.dlaxkntvxuhkhymrqret:58*f?G3+Urh.%N+@aws-1-eu-west-1.pooler.supabase.com:6543/postgres",
+).strip()
+USE_POSTGRES = bool(DATABASE_URL and DATABASE_URL.startswith(("postgres://", "postgresql://")) and _HAS_PG)
+
+# ---- Web App ----
 WEBAPP_PORT = int(os.environ.get("WEBAPP_PORT", "8080"))
 WEBAPP_PUBLIC_URL = os.environ.get("WEBAPP_PUBLIC_URL", "https://farma-six-eosin.vercel.app/")
 _WEBAPP_ORIGIN_DEFAULT = WEBAPP_PUBLIC_URL.rstrip("/")
@@ -92,12 +107,9 @@ INFO_TEXT = (
     "• «Гусь крутити [ставка]» / «Гусь слоти [ставка]»\n"
     "• «Гусь дуель @username [ставка]» / «Гусь цуефа @user [ставка]»\n"
     "• «Гусь топ» / «Гусь їжа»\n\n"
-    "<b>🐄 ФЕРМА (напиши «Гусь ферма»):</b>\n"
-    "• Магазин / Ринок / Маркетплейс / Бізнес\n"
-    "• Робітники / Поле пшениці / Силоси\n"
-    "• Посадити картоплю / Зібрати\n\n"
-    "<b>🌐 Веб-версія:</b> тисни кнопку «🐄 Грати» в меню бота — відкриється гра\n"
-    "у Telegram Mini App з тим самим балансом і фермою.\n\n"
+    "<b>🐄 ФЕРМА (напиши «Гусь ферма» в групі):</b>\n"
+    "• Відкривається Web App (та сама ферма, як у веб-версії)\n"
+    "• Або натисни «📋 Текстова версія» — стара текстова ферма\n\n"
     "<b>Для адміна:</b>\n"
     "• /admin / /lid2 / /settopic / /event\n"
     "• /give /take /setbal @username|ID N\n"
@@ -368,8 +380,153 @@ SELLABLE_ITEMS = {
 }
 
 
+# ================= SQLite → PostgreSQL адаптер =================
+def _translate_sql(sql: str) -> str:
+    s = sql.strip()
+    if not s:
+        return s
+    upper = s.upper()
+    if upper.startswith("PRAGMA"):
+        return "SELECT 1 WHERE FALSE"
+    if "AUTOINCREMENT" in upper:
+        s = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "SERIAL PRIMARY KEY", s, flags=re.IGNORECASE)
+    if re.match(r"^INSERT\s+OR\s+IGNORE\s+INTO", upper):
+        s = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", s, flags=re.IGNORECASE)
+        if "ON CONFLICT" not in s.upper():
+            s = s.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+    if re.match(r"^INSERT\s+OR\s+REPLACE\s+INTO", upper):
+        m = re.match(r"^INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)", s, flags=re.IGNORECASE)
+        if m:
+            table = m.group(1).lower()
+            cols = [c.strip() for c in m.group(2).split(",")]
+            if table == "workers":
+                conflict, exclude = "(chat_id, user_id, worker_key)", ("chat_id", "user_id", "worker_key")
+            else:
+                conflict, exclude = "(chat_id, user_id)", ("chat_id", "user_id")
+            update_cols = [c for c in cols if c not in exclude]
+            set_clause = ", ".join(f"{c}=EXCLUDED.{c}" for c in update_cols) or "chat_id=EXCLUDED.chat_id"
+            s = re.sub(r"^INSERT\s+OR\s+REPLACE\s+INTO", "INSERT INTO", s, flags=re.IGNORECASE)
+            s = s.rstrip().rstrip(";") + f" ON CONFLICT {conflict} DO UPDATE SET {set_clause}"
+    s = re.sub(r"\bMAX\s*\(\s*0\s*,", "GREATEST(0,", s)
+    s = re.sub(r"\bMAX\s*\(\s*50\s*,", "GREATEST(50,", s)
+    s = s.replace("?", "%s")
+    return s
+
+
+class _PgCursorWrapper:
+    def __init__(self, parent):
+        self._parent = parent
+        self._cur = parent._conn.cursor()
+        self.lastrowid = None
+
+    def execute(self, sql, params=None):
+        translated = _translate_sql(sql)
+        has_returning = "RETURNING" in translated.upper() and translated.strip().upper().startswith("INSERT")
+        try:
+            self._cur.execute(translated, params) if params is not None else self._cur.execute(translated)
+        except Exception:
+            try:
+                self._parent._conn.rollback()
+            except Exception:
+                pass
+            raise
+        if has_returning:
+            try:
+                row = self._cur.fetchone()
+                self.lastrowid = row[0] if row else None
+            except Exception:
+                pass
+        return self
+
+    def executemany(self, sql, seq):
+        translated = _translate_sql(sql)
+        try:
+            self._cur.executemany(translated, seq)
+        except Exception:
+            try:
+                self._parent._conn.rollback()
+            except Exception:
+                pass
+            raise
+        return self
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def close(self):
+        try:
+            self._cur.close()
+        except Exception:
+            pass
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+    def __iter__(self):
+        return iter(self._cur)
+
+
+class PgConnection:
+    def __init__(self, dsn: str):
+        # Supabase pooler може містити спецсимволи в паролі — розбираємо через urllib
+        parsed = urllib.parse.urlparse(dsn)
+        if parsed.hostname:
+            self._conn = psycopg2.connect(
+                host=parsed.hostname,
+                port=parsed.port or 5432,
+                user=urllib.parse.unquote(parsed.username or ""),
+                password=urllib.parse.unquote(parsed.password or ""),
+                dbname=(parsed.path or "/postgres").lstrip("/") or "postgres",
+                sslmode="require",
+                connect_timeout=20,
+            )
+        else:
+            self._conn = psycopg2.connect(dsn)
+        self._conn.autocommit = False
+
+    def execute(self, sql, params=None):
+        return _PgCursorWrapper(self).execute(sql, params)
+
+    def executemany(self, sql, seq):
+        return _PgCursorWrapper(self).executemany(sql, seq)
+
+    def cursor(self):
+        return _PgCursorWrapper(self)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
+def _get_table_columns(conn, table_name):
+    cur = conn.cursor()
+    if USE_POSTGRES:
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table_name,))
+    else:
+        cur.execute(f"PRAGMA table_info({table_name})")
+    rows = cur.fetchall()
+    cur.close()
+    if USE_POSTGRES:
+        return {r[0] for r in rows}
+    return {r[1] for r in rows}
+
+
 # ================= БАЗА ДАНИХ =================
 def db_connect():
+    if USE_POSTGRES:
+        return PgConnection(DATABASE_URL)
     conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA busy_timeout=30000")
@@ -382,69 +539,69 @@ def init_db():
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     cur.execute("CREATE TABLE IF NOT EXISTS subject_links (key TEXT PRIMARY KEY, title TEXT, url TEXT, keyword TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS muted_users (chat_id INTEGER, user_id INTEGER, PRIMARY KEY (chat_id, user_id))")
-    cur.execute("CREATE TABLE IF NOT EXISTS schedule (chat_id INTEGER, target_date TEXT, idx INTEGER, subject TEXT, PRIMARY KEY (chat_id, idx))")
-    cur.execute("CREATE TABLE IF NOT EXISTS ai_chat_settings (chat_id INTEGER PRIMARY KEY, enabled INTEGER)")
-    cur.execute("CREATE TABLE IF NOT EXISTS economy (chat_id INTEGER, user_id INTEGER, balance INTEGER DEFAULT 0, last_bonus TEXT, active_title TEXT, PRIMARY KEY (chat_id, user_id))")
-    cur.execute("CREATE TABLE IF NOT EXISTS user_titles (chat_id INTEGER, user_id INTEGER, title TEXT, PRIMARY KEY (chat_id, user_id, title))")
+    cur.execute("CREATE TABLE IF NOT EXISTS muted_users (chat_id BIGINT, user_id BIGINT, PRIMARY KEY (chat_id, user_id))")
+    cur.execute("CREATE TABLE IF NOT EXISTS schedule (chat_id BIGINT, target_date TEXT, idx INTEGER, subject TEXT, PRIMARY KEY (chat_id, idx))")
+    cur.execute("CREATE TABLE IF NOT EXISTS ai_chat_settings (chat_id BIGINT PRIMARY KEY, enabled INTEGER)")
+    cur.execute("CREATE TABLE IF NOT EXISTS economy (chat_id BIGINT, user_id BIGINT, balance BIGINT DEFAULT 0, last_bonus TEXT, active_title TEXT, PRIMARY KEY (chat_id, user_id))")
+    cur.execute("CREATE TABLE IF NOT EXISTS user_titles (chat_id BIGINT, user_id BIGINT, title TEXT, PRIMARY KEY (chat_id, user_id, title))")
     cur.execute("""CREATE TABLE IF NOT EXISTS users (
-        chat_id INTEGER, user_id INTEGER, name TEXT, username TEXT,
-        balance INTEGER DEFAULT 0, tag TEXT,
+        chat_id BIGINT, user_id BIGINT, name TEXT, username TEXT,
+        balance BIGINT DEFAULT 0, tag TEXT,
         PRIMARY KEY (chat_id, user_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS farm (
-        chat_id INTEGER, user_id INTEGER,
+        chat_id BIGINT, user_id BIGINT,
         chickens INTEGER DEFAULT 0, pigs INTEGER DEFAULT 0, cows INTEGER DEFAULT 0,
         feed INTEGER DEFAULT 0, potato_seed INTEGER DEFAULT 0,
         eggs INTEGER DEFAULT 0, milk INTEGER DEFAULT 0, meat INTEGER DEFAULT 0, potato INTEGER DEFAULT 0,
         planted_count INTEGER DEFAULT 0, planted_at TEXT, last_collect TEXT,
         PRIMARY KEY (chat_id, user_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS contracts (
-        contract_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER, user_id INTEGER, product TEXT, need INTEGER, reward INTEGER,
+        contract_id SERIAL PRIMARY KEY,
+        chat_id BIGINT, user_id BIGINT, product TEXT, need INTEGER, reward BIGINT,
         deadline TEXT, text TEXT, active INTEGER DEFAULT 1)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS user_tags (
-        chat_id INTEGER, user_id INTEGER, tag_key TEXT, tag_text TEXT,
+        chat_id BIGINT, user_id BIGINT, tag_key TEXT, tag_text TEXT,
         PRIMARY KEY (chat_id, user_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, chat_id INTEGER, user_id INTEGER,
-        event TEXT NOT NULL, amount INTEGER DEFAULT 0, balance_after INTEGER,
-        balance_before INTEGER, status TEXT DEFAULT 'ok', details TEXT)""")
+        id SERIAL PRIMARY KEY, ts TEXT NOT NULL, chat_id BIGINT, user_id BIGINT,
+        event TEXT NOT NULL, amount BIGINT DEFAULT 0, balance_after BIGINT,
+        balance_before BIGINT, status TEXT DEFAULT 'ok', details TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS businesses (
-        chat_id INTEGER, user_id INTEGER, biz_key TEXT, qty INTEGER DEFAULT 0, last_collect TEXT,
+        chat_id BIGINT, user_id BIGINT, biz_key TEXT, qty INTEGER DEFAULT 0, last_collect TEXT,
         PRIMARY KEY (chat_id, user_id, biz_key))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS prestige (
-        chat_id INTEGER, user_id INTEGER, level INTEGER DEFAULT 0,
+        chat_id BIGINT, user_id BIGINT, level INTEGER DEFAULT 0,
         PRIMARY KEY (chat_id, user_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS bank (
-        chat_id INTEGER, user_id INTEGER, deposit INTEGER DEFAULT 0, deposited_at TEXT,
+        chat_id BIGINT, user_id BIGINT, deposit BIGINT DEFAULT 0, deposited_at TEXT,
         PRIMARY KEY (chat_id, user_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS jackpot (
-        chat_id INTEGER PRIMARY KEY, pot INTEGER DEFAULT 0, last_draw TEXT)""")
+        chat_id BIGINT PRIMARY KEY, pot BIGINT DEFAULT 0, last_draw TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS jackpot_tickets (
-        chat_id INTEGER, user_id INTEGER, tickets INTEGER DEFAULT 0,
+        chat_id BIGINT, user_id BIGINT, tickets INTEGER DEFAULT 0,
         PRIMARY KEY (chat_id, user_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS shop_stock (
-        chat_id INTEGER, item_key TEXT, stock REAL, last_refill TEXT,
+        chat_id BIGINT, item_key TEXT, stock REAL, last_refill TEXT,
         PRIMARY KEY (chat_id, item_key))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS workers (
-        chat_id INTEGER, user_id INTEGER, worker_key TEXT, hired_at TEXT,
+        chat_id BIGINT, user_id BIGINT, worker_key TEXT, hired_at TEXT,
         PRIMARY KEY (chat_id, user_id, worker_key))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS wheat_fields (
-        chat_id INTEGER, user_id INTEGER, plots INTEGER DEFAULT 0,
+        chat_id BIGINT, user_id BIGINT, plots INTEGER DEFAULT 0,
         wheat INTEGER DEFAULT 0, wheat_seed INTEGER DEFAULT 0,
         planted_count INTEGER DEFAULT 0, planted_at TEXT,
         eu_sold_today INTEGER DEFAULT 0, eu_reset_date TEXT,
         silos INTEGER DEFAULT 0,
         PRIMARY KEY (chat_id, user_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS marketplace (
-        listing_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER, seller_id INTEGER, item_key TEXT,
-        qty INTEGER, price INTEGER, created_at TEXT, active INTEGER DEFAULT 1)""")
+        listing_id SERIAL PRIMARY KEY,
+        chat_id BIGINT, seller_id BIGINT, item_key TEXT,
+        qty INTEGER, price BIGINT, created_at TEXT, active INTEGER DEFAULT 1)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS pending_trades (
-        trade_id TEXT PRIMARY KEY, chat_id INTEGER, seller_id INTEGER, buyer_id INTEGER,
-        item_key TEXT, qty INTEGER, price INTEGER, created_at TEXT, active INTEGER DEFAULT 1)""")
+        trade_id TEXT PRIMARY KEY, chat_id BIGINT, seller_id BIGINT, buyer_id BIGINT,
+        item_key TEXT, qty INTEGER, price BIGINT, created_at TEXT, active INTEGER DEFAULT 1)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS user_starter (
-        chat_id INTEGER, user_id INTEGER, claimed_at TEXT,
+        chat_id BIGINT, user_id BIGINT, claimed_at TEXT,
         PRIMARY KEY (chat_id, user_id))""")
     conn.commit()
     conn.close()
@@ -453,8 +610,7 @@ def init_db():
 def migrate_farm_v2():
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("PRAGMA table_info(farm)")
-    existing = {r[1] for r in cur.fetchall()}
+    existing = _get_table_columns(conn, "farm")
     migrations = {
         "roosters": "INTEGER DEFAULT 0", "chicks": "INTEGER DEFAULT 0", "ostriches": "INTEGER DEFAULT 0",
         "grain": "INTEGER DEFAULT 0", "hay": "INTEGER DEFAULT 0", "mix": "INTEGER DEFAULT 0",
@@ -472,10 +628,9 @@ def migrate_farm_v2():
 def migrate_users_v3():
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("PRAGMA table_info(users)")
-    existing = {r[1] for r in cur.fetchall()}
+    existing = _get_table_columns(conn, "users")
     if "balance" not in existing:
-        cur.execute("ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE users ADD COLUMN balance BIGINT DEFAULT 0")
     if "tag" not in existing:
         cur.execute("ALTER TABLE users ADD COLUMN tag TEXT")
     conn.commit()
@@ -491,8 +646,7 @@ def migrate_users_v3():
 def migrate_workers_expiry():
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("PRAGMA table_info(workers)")
-    existing = {r[1] for r in cur.fetchall()}
+    existing = _get_table_columns(conn, "workers")
     if "expires_at" not in existing:
         cur.execute("ALTER TABLE workers ADD COLUMN expires_at TEXT")
         conn.commit()
@@ -502,8 +656,7 @@ def migrate_workers_expiry():
 def migrate_wheat_silos():
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("PRAGMA table_info(wheat_fields)")
-    existing = {r[1] for r in cur.fetchall()}
+    existing = _get_table_columns(conn, "wheat_fields")
     if "silos" not in existing:
         cur.execute("ALTER TABLE wheat_fields ADD COLUMN silos INTEGER DEFAULT 0")
         conn.commit()
@@ -514,10 +667,9 @@ def migrate_wheat_silos():
 def migrate_logs_v2():
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("PRAGMA table_info(logs)")
-    existing = {r[1] for r in cur.fetchall()}
+    existing = _get_table_columns(conn, "logs")
     if "balance_before" not in existing:
-        cur.execute("ALTER TABLE logs ADD COLUMN balance_before INTEGER")
+        cur.execute("ALTER TABLE logs ADD COLUMN balance_before BIGINT")
     if "status" not in existing:
         cur.execute("ALTER TABLE logs ADD COLUMN status TEXT DEFAULT 'ok'")
     conn.commit()
@@ -747,24 +899,6 @@ def db_ensure_user_rows(chat_id, user_id):
         conn.commit()
     finally:
         conn.close()
-
-
-def db_add_owned_title(chat_id, user_id, title):
-    conn = db_connect()
-    try:
-        conn.execute("INSERT OR IGNORE INTO user_titles (chat_id, user_id, title) VALUES (?, ?, ?)", (chat_id, user_id, title))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def db_load_owned_titles():
-    conn = db_connect()
-    try:
-        rows = conn.execute("SELECT chat_id, user_id, title FROM user_titles").fetchall()
-    finally:
-        conn.close()
-    return rows
 
 
 def db_save_user_tag(chat_id, user_id, tag_key, tag_text):
@@ -1407,10 +1541,26 @@ def collect_business_income(chat_id, user_id):
 def create_listing(chat_id, seller_id, item_key, qty, price):
     conn = db_connect()
     try:
-        cur = conn.execute("INSERT INTO marketplace (chat_id, seller_id, item_key, qty, price, created_at, active) VALUES (?, ?, ?, ?, ?, ?, 1)",
-                           (chat_id, seller_id, item_key, qty, price, datetime.now(KYIV_TZ).isoformat()))
-        conn.commit()
-        return cur.lastrowid
+        cur = conn.cursor()
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO marketplace (chat_id, seller_id, item_key, qty, price, created_at, active) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1) RETURNING listing_id",
+                (chat_id, seller_id, item_key, qty, price, datetime.now(KYIV_TZ).isoformat()))
+            row = cur.fetchone()
+            listing_id = row[0] if row else None
+            cur.close()
+            conn.commit()
+            return listing_id
+        else:
+            cur.execute(
+                "INSERT INTO marketplace (chat_id, seller_id, item_key, qty, price, created_at, active) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1)",
+                (chat_id, seller_id, item_key, qty, price, datetime.now(KYIV_TZ).isoformat()))
+            listing_id = cur.lastrowid
+            cur.close()
+            conn.commit()
+            return listing_id
     finally:
         conn.close()
 
@@ -1644,7 +1794,7 @@ async def apply_event_effect(chat_id: int, effect: str) -> str:
         elif effect == "tax":
             cur.execute("SELECT COUNT(*) FROM economy WHERE balance > 100")
             n = cur.fetchone()[0]
-            cur.execute("UPDATE economy SET balance = MAX(0, balance - MAX(50, CAST(balance * 0.03 AS INTEGER))) WHERE balance > 100")
+            cur.execute("UPDATE economy SET balance = GREATEST(0, balance - GREATEST(50, CAST(balance * 0.03 AS INTEGER))) WHERE balance > 100")
             affected = f"💸 Оштрафовано: {n} ферм."
         elif effect == "drought":
             cur.execute("UPDATE farm SET planted_count = 0, planted_at = NULL WHERE planted_count > 0")
@@ -1820,7 +1970,6 @@ async def send_photo_cached(target, url: str, caption: str, kb, reply=False):
     file_id = _banner_file_id_cache.get(url)
     if file_id == "FAILED":
         return None
-
     try:
         if file_id:
             if reply:
@@ -1849,12 +1998,39 @@ async def send_photo_cached(target, url: str, caption: str, kb, reply=False):
         return None
 
 
-async def send_farm_photo(chat_id, user_id, reply_target):
-    text = render_farm_text_v2(chat_id, user_id)
-    kb = build_farm_main_kb(user_id, chat_id)
+# ============ ФЕРМА + Web App (головна зміна!) ============
+def _build_farm_webapp_kb(uid):
+    """Кнопка Web App + текстова версія + швидкі дії."""
+    url = db_get_setting("webapp_url") or WEBAPP_PUBLIC_URL
+    rows = []
+    if url and url.startswith("https://"):
+        rows.append([InlineKeyboardButton(text="🌐 Відкрити Web App", web_app=WebAppInfo(url=url))])
+    rows.append([InlineKeyboardButton(text="📋 Текстова версія ферми", callback_data=f"farmtext|{uid}")])
+    rows.append([
+        InlineKeyboardButton(text="🧺 Зібрати все", callback_data=f"farm|collect|{uid}"),
+        InlineKeyboardButton(text="🛒 Магазин", callback_data=f"shop|main|{uid}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_farm_webapp_prompt(chat_id, user_id, reply_target):
+    """
+    Головна функція для групи: показує Web App кнопку + кнопку текстової ферми.
+    """
+    text = (
+        "🐄 <b>ФЕРМА А-11</b>\n\n"
+        "🌐 Натисни <b>«Відкрити Web App»</b> — повноцінна гра з тим самим балансом,\n"
+        "   тваринами, бізнесами й полем. Працює як справжній застосунок.\n\n"
+        "📋 Або <b>«Текстова версія»</b> — стара ферма просто в чаті.\n\n"
+        "💡 Web App можна також закріпити: правий клік на кнопці → «Закріпити»."
+    )
+    kb = _build_farm_webapp_kb(user_id)
     msg = await send_photo_cached(reply_target, FARM_BANNER_URL, text, kb, reply=True)
     if msg is None:
-        await reply_target.reply(text, parse_mode="HTML", reply_markup=kb)
+        try:
+            await reply_target.reply(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
 
 async def send_shop_photo(chat_id, user_id, reply_target):
@@ -1985,7 +2161,7 @@ async def check_permissions(user, chat):
     starosta = (state_data.get("starosta_username") or "").lower()
     if user_username and starosta and user_username == starosta:
         return True
-    if chat.type in ["group", "supergroup"]:
+    if chat and chat.type in ["group", "supergroup"]:
         try:
             member = await bot.get_chat_member(chat.id, user.id)
             if member.status in ["creator", "administrator"]:
@@ -2211,25 +2387,19 @@ def build_admin_keyboard(chat_id):
     ])
 
 
-# ================= ФІКС RENDER (без спама) =================
+# ================= ФІКС RENDER =================
 async def render_screen(cb, banner, caption, kb):
     msg = cb.message
     if msg is None:
         return
-
     banner_failed = _banner_file_id_cache.get(banner) == "FAILED"
-
     if msg.photo and not banner_failed:
         file_id = _banner_file_id_cache.get(banner)
         try:
             if file_id and file_id != "FAILED":
-                await msg.edit_media(
-                    media=InputMediaPhoto(media=file_id, caption=caption, parse_mode="HTML"),
-                    reply_markup=kb)
+                await msg.edit_media(media=InputMediaPhoto(media=file_id, caption=caption, parse_mode="HTML"), reply_markup=kb)
             else:
-                await msg.edit_media(
-                    media=InputMediaPhoto(media=banner, caption=caption, parse_mode="HTML"),
-                    reply_markup=kb)
+                await msg.edit_media(media=InputMediaPhoto(media=banner, caption=caption, parse_mode="HTML"), reply_markup=kb)
                 if msg.photo:
                     _banner_file_id_cache[banner] = msg.photo[-1].file_id
             return
@@ -2246,7 +2416,6 @@ async def render_screen(cb, banner, caption, kb):
             logging.warning(f"[RENDER] edit_media: {e}")
         except Exception as e:
             logging.warning(f"[RENDER] edit_media err: {e}")
-
     try:
         await msg.edit_text(caption, parse_mode="HTML", reply_markup=kb)
         return
@@ -2259,7 +2428,6 @@ async def render_screen(cb, banner, caption, kb):
                 pass
             return
         if "there is no text in the message" in s:
-            logging.debug(f"[RENDER] skip fallback (no text): {e}")
             return
         logging.warning(f"[RENDER] edit_text: {e}")
     except Exception as e:
@@ -2349,7 +2517,11 @@ MARKET_ANIMALS = {
 
 
 def build_farm_main_kb(uid, chat_id=0):
-    return InlineKeyboardMarkup(inline_keyboard=[
+    url = db_get_setting("webapp_url") or WEBAPP_PUBLIC_URL
+    rows = []
+    if url and url.startswith("https://"):
+        rows.append([InlineKeyboardButton(text="🌐 Відкрити Web App", web_app=WebAppInfo(url=url))])
+    rows += [
         [InlineKeyboardButton(text="🛒 Магазин «Агроном»", callback_data=f"shop|main|{uid}"),
          InlineKeyboardButton(text="💱 Ринок", callback_data=f"market|main|{uid}")],
         [InlineKeyboardButton(text="🛍️ Маркетплейс (гравці)", callback_data=f"mkt|menu|{uid}")],
@@ -2365,7 +2537,8 @@ def build_farm_main_kb(uid, chat_id=0):
          InlineKeyboardButton(text="🐤 Виростити курчат", callback_data=f"farm|raise|{uid}")],
         [InlineKeyboardButton(text="📋 Контракти", callback_data=f"market|contracts|{uid}"),
          InlineKeyboardButton(text="🔄 Оновити", callback_data=f"farm|menu|{uid}")],
-    ])
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_shop_main_kb(uid):
@@ -2381,10 +2554,7 @@ def build_shop_category_kb(cat_key, uid, chat_id=0):
         stock_txt = ""
         if key in SHOP_STOCK and chat_id:
             stock_txt = f" [{int(get_stock(chat_id, key)):,}]"
-        rows.append([InlineKeyboardButton(
-            text=f"{name} — {shop_item_price(key)} 🪙{stock_txt}",
-            callback_data=f"shop|buy|{cat_key}|{key}|{uid}"
-        )])
+        rows.append([InlineKeyboardButton(text=f"{name} — {shop_item_price(key)} 🪙{stock_txt}", callback_data=f"shop|buy|{cat_key}|{key}|{uid}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"shop|main|{uid}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3031,6 +3201,26 @@ def build_jackpot_kb(uid):
 
 
 # ================= ХЕНДЛЕРИ =================
+# Обробник кнопки "📋 Текстова версія ферми"
+@dp.callback_query(F.data.startswith("farmtext|"))
+async def cb_farmtext(cb):
+    uid = parse_owner(cb)
+    if uid is None:
+        await safe_answer(cb)
+        return
+    if cb.from_user.id != uid:
+        await safe_answer(cb, "🚫 Це не твоя ферма! Напиши «Гусь ферма».", show_alert=True)
+        return
+    chat_id = cb.message.chat.id
+    await safe_answer(cb)
+    text = render_farm_text_v2(chat_id, uid)
+    kb = build_farm_main_kb(uid, chat_id)
+    try:
+        await cb.message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    except Exception as e:
+        logging.error(f"[FARMTEXT] {e}")
+
+
 @dp.callback_query(F.data.startswith("farm|"))
 async def cb_farm_router(cb):
     owner_id = parse_owner(cb)
@@ -4442,13 +4632,7 @@ async def cmd_setwebapp(message):
         return
     url = args[1].strip()
     db_save_setting("webapp_url", url)
-    try:
-        await bot.set_chat_menu_button(
-            menu_button=MenuButtonWebApp(text="🐄 Грати", web_app=WebAppInfo(url=url))
-        )
-    except Exception as e:
-        logging.error(f"[WEBAPP] set menu button: {e}")
-    await message.reply(f"✅ Веб-гру підключено: {url}\nКнопка меню оновлена.")
+    await message.reply(f"✅ Веб-гру підключено: {url}\nТепер у групі «Гусь ферма» відкриватиме Web App.")
 
 
 @dp.message(Command("settopic"))
@@ -4497,8 +4681,9 @@ async def cmd_reload(message):
     ai_chat_enabled.clear()
     chat_schedules.clear()
     load_state_from_db()
+    db_info = "PostgreSQL" if USE_POSTGRES else "SQLite"
     await message.reply(
-        f"🔄 <b>Перезавантажено з БД!</b>\n\n"
+        f"🔄 <b>Перезавантажено з БД ({db_info})!</b>\n\n"
         f"👥 Юзерів: {sum(len(v) for v in known_users.values())}\n"
         f"🐄 Ферм: {len(farm_cache)}\n"
         f"💰 Балансів: {len(economy_cache)}",
@@ -5044,10 +5229,11 @@ async def handle_group_messages(message):
         await message.reply("🔊 Ну нарешті, скучив сука? Ладно знову тегатиму.")
         return
 
+    # 🌐 ГОЛОВНА ЗМІНА: "Гусь ферма" → показуємо Web App + кнопку текстової версії
     if FARM_RE.match(rest) and user_id:
         if not has_claimed_starter(chat_id, user_id):
             asyncio.create_task(_grant_and_notify_starter(chat_id, user_id))
-        await send_farm_photo(chat_id, user_id, message)
+        await send_farm_webapp_prompt(chat_id, user_id, message)
         return
     if rest.startswith("магазин") and user_id:
         await send_shop_photo(chat_id, user_id, message)
@@ -5371,7 +5557,7 @@ async def handle_group_messages(message):
             await message.reply("🤖 ШІ недоступний.")
 
 
-# ================= WEB APP API (Telegram Mini App) =================
+# ================= WEB APP API =================
 def verify_telegram_init_data(init_data: str, bot_token: str, max_age_sec: int = 86400):
     if not init_data:
         return None
@@ -5431,7 +5617,6 @@ async def cors_middleware(request, handler):
 
 @web.middleware
 async def auth_middleware(request, handler):
-    # Пропускаємо все, крім /api/* (вебхук Telegram, /health, корінь)
     if not request.path.startswith("/api/"):
         return await handler(request)
     if request.path == "/api/auth" or request.method == "OPTIONS":
@@ -5453,30 +5638,22 @@ async def api_auth(request):
     user = verify_telegram_init_data(init_data, BOT_TOKEN)
     if not user:
         return _json_error("bad_signature: could not verify Telegram initData", status=401)
-
     chat_id = get_web_chat_id()
     if chat_id is None:
-        return _json_error("bot_not_configured: адмін ще не виконав /settopic або бот жодного разу не бачив групу", status=503)
-
+        return _json_error("bot_not_configured", status=503)
     uid = user["id"]
     first = user.get("first_name", "") or ""
     last = user.get("last_name", "") or ""
     name = (first + " " + last).strip() or str(uid)
     username = (user.get("username") or "").lower() or None
-
     db_upsert_user_unique(chat_id, uid, name, username)
     db_ensure_user_rows(chat_id, uid)
     is_new = not has_claimed_starter(chat_id, uid)
     if is_new:
         claim_starter_kit(chat_id, uid)
-
     return web.json_response({
-        "ok": True,
-        "chat_id": chat_id,
-        "user_id": uid,
-        "name": name,
-        "username": username,
-        "is_new_player": is_new,
+        "ok": True, "chat_id": chat_id, "user_id": uid,
+        "name": name, "username": username, "is_new_player": is_new,
     })
 
 
@@ -5493,16 +5670,11 @@ def _serialize_farm_state(chat_id, uid):
     lvl, lvl_name = farm_level_from_xp(farm.get("farm_xp", 0))
     contract = get_active_contract(chat_id, uid)
     return {
-        "farm": farm,
-        "economy": {"balance": econ["balance"]},
+        "farm": farm, "economy": {"balance": econ["balance"]},
         "wheat": {**wheat, "capacity": wheat_capacity(chat_id, uid)},
-        "workers": workers,
-        "worker_wage_per_hour": get_total_wage_per_hour(chat_id, uid),
-        "business": biz,
-        "prestige_level": get_prestige_level(chat_id, uid),
-        "tag": tag[1] if tag else None,
-        "level": lvl,
-        "level_name": lvl_name,
+        "workers": workers, "worker_wage_per_hour": get_total_wage_per_hour(chat_id, uid),
+        "business": biz, "prestige_level": get_prestige_level(chat_id, uid),
+        "tag": tag[1] if tag else None, "level": lvl, "level_name": lvl_name,
         "contract": contract,
     }
 
@@ -5527,7 +5699,6 @@ async def api_action(request):
     except Exception:
         body = {}
     action = body.get("action")
-
     if action == "plant_potato":
         msg = farm_plant_potato(chat_id, uid, body.get("count"))
     elif action == "collect_farm":
@@ -5643,7 +5814,6 @@ async def api_action(request):
             msg = f"+{gain} 🪙"
     else:
         return _json_error(f"unknown_action: {action}")
-
     return web.json_response({"ok": True, "message": str(msg), "state": _serialize_farm_state(chat_id, uid)})
 
 
@@ -5656,13 +5826,8 @@ async def api_leaderboard(request):
     for uid, bal in rows:
         farm = farm_cache.get((chat_id, uid)) or get_farm(chat_id, uid)
         lvl, lvl_name = farm_level_from_xp(farm.get("farm_xp", 0))
-        out.append({
-            "user_id": uid,
-            "name": get_display_name(chat_id, uid),
-            "balance": bal,
-            "level": lvl,
-            "level_name": lvl_name,
-        })
+        out.append({"user_id": uid, "name": get_display_name(chat_id, uid),
+                    "balance": bal, "level": lvl, "level_name": lvl_name})
     return web.json_response({"leaderboard": out})
 
 
@@ -5674,26 +5839,21 @@ async def api_me(request):
         return _json_error("bot_not_configured", status=503)
     info = db_get_user_info(chat_id, uid)
     return web.json_response({
-        "user_id": uid,
-        "name": info["name"] or str(uid),
-        "username": info["username"],
-        "balance": info["balance_econ"],
-        "tag": info["tag"],
+        "user_id": uid, "name": info["name"] or str(uid),
+        "username": info["username"], "balance": info["balance_econ"], "tag": info["tag"],
     })
 
 
 async def set_webapp_menu_button():
-    url = db_get_setting("webapp_url") or (WEBAPP_PUBLIC_URL if WEBAPP_PUBLIC_URL.startswith("https://") else None)
-    if not url:
-        logging.info("[WEBAPP] URL не задано — кнопку меню пропущено. Задай через /setwebapp або WEBAPP_PUBLIC_URL.")
-        return
+    """
+    У групах ставимо звичайне меню з командами (щоб не було кнопки "Грати" в чаті),
+    а в приватних — залишаємо Web App кнопку через /start.
+    """
     try:
-        await bot.set_chat_menu_button(
-            menu_button=MenuButtonWebApp(text="🐄 Грати", web_app=WebAppInfo(url=url))
-        )
-        logging.info(f"[WEBAPP] Кнопку меню встановлено: {url}")
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        logging.info("[WEBAPP] Меню бота → команди")
     except Exception as e:
-        logging.warning(f"[WEBAPP] set_chat_menu_button: {e} (бот продовжує працювати)")
+        logging.warning(f"[WEBAPP] set_chat_menu_button: {e}")
 
 
 # ================= ЗАГРУЗКА / MAIN =================
@@ -5794,20 +5954,19 @@ async def main():
 
     me = await bot.get_me()
     BOT_USERNAME = me.username
-    print(f"🚀 Бот запущено як @{BOT_USERNAME}...")
+    db_mode = "PostgreSQL (Supabase)" if USE_POSTGRES else "SQLite (local file)"
+    print(f"🚀 Бот запущено як @{BOT_USERNAME}")
+    print(f"🗄️  БД: {db_mode}")
     print(f"👥 Користувачів: {sum(len(v) for v in known_users.values())}")
     print(f"🐄 Ферм: {len(farm_cache)}")
 
     asyncio.create_task(migrate_starter_to_existing())
     asyncio.create_task(global_events_loop())
 
-    # ==== Єдиний aiohttp-додаток: Web App API + Telegram Webhook ====
     port = int(os.environ.get("PORT", 8080))
     render_url = (os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
     app = web.Application(middlewares=[cors_middleware, auth_middleware])
-
-    # Web App API
     app.router.add_post("/api/auth", api_auth)
     app.router.add_get("/api/state", api_state)
     app.router.add_post("/api/action", api_action)
@@ -5816,51 +5975,40 @@ async def main():
     for route in ["/api/auth", "/api/state", "/api/action", "/api/leaderboard", "/api/me"]:
         app.router.add_route("OPTIONS", route, lambda r: web.Response(status=204))
 
-    # Health-check (для UptimeRobot)
     async def _health(_req):
         return web.Response(text="OK")
     app.router.add_get("/", _health)
     app.router.add_get("/health", _health)
 
-    # Webhook Telegram
     if render_url:
         webhook_path = "/webhook"
         webhook_url = f"{render_url}{webhook_path}"
         try:
-            await bot.set_webhook(
-                url=webhook_url,
-                drop_pending_updates=True,
-                allowed_updates=dp.resolve_used_update_types(),
-            )
+            await bot.set_webhook(url=webhook_url, drop_pending_updates=True,
+                                  allowed_updates=dp.resolve_used_update_types())
             logging.info(f"[WEBHOOK] Встановлено: {webhook_url}")
         except Exception as e:
-            logging.error(f"[WEBHOOK] Помилка встановлення: {e}")
-
+            logging.error(f"[WEBHOOK] Помилка: {e}")
         SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=webhook_path)
         setup_application(app, dp, bot=bot)
     else:
-        logging.info("[MODE] RENDER_EXTERNAL_URL не задано → polling (тільки локально)")
+        logging.info("[MODE] RENDER_EXTERNAL_URL не задано → polling")
 
-    # Запуск HTTP-сервера
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logging.info(f"[SERVER] Слухає 0.0.0.0:{port}")
 
-    # Кнопка меню "🐄 Грати"
     try:
         await set_webapp_menu_button()
     except Exception as e:
         logging.warning(f"[WEBAPP] menu button: {e}")
 
-    # Далі:
     if render_url:
-        # Продакшн на Render — вебхук. Тримаємо процес живим.
         while True:
             await asyncio.sleep(3600)
     else:
-        # Локальна розробка — polling
         try:
             await bot.delete_webhook(drop_pending_updates=False)
         except Exception:
