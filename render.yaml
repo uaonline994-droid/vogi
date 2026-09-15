@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: a11-bot
+    runtime: python
+    plan: free
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: GLOBAL_CHAT_ID
+        value: "-1004205659745"
+      - key: WEBAPP_PUBLIC_URL
+        value: "https://farma-six-eosin.vercel.app"
+      - key: WEBAPP_CORS_ORIGINS
+        value: "https://farma-six-eosin.vercel.app"
+      - key: WEBAPP_ENABLED
+        value: "1"
